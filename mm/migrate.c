@@ -2133,28 +2133,18 @@ out_unlock:
 #endif /* CONFIG_NUMA */
 
 #if defined(CONFIG_MIGRATE_VMA_HELPER)
-struct migrate_vma {
-	struct vm_area_struct	*vma;
-	unsigned long		*dst;
-	unsigned long		*src;
-	unsigned long		cpages;
-	unsigned long		npages;
-	unsigned long		start;
-	unsigned long		end;
-};
-
 static int migrate_vma_collect_hole(unsigned long start,
 				    unsigned long end,
 				    struct mm_walk *walk)
 {
-	struct migrate_vma *migrate = walk->private;
+	struct migrate_dma_ctx *migrate_ctx = walk->private;
 	unsigned long addr;
 
 	for (addr = start & PAGE_MASK; addr < end; addr += PAGE_SIZE) {
-		migrate->src[migrate->npages] = MIGRATE_PFN_MIGRATE;
-		migrate->dst[migrate->npages] = 0;
-		migrate->npages++;
-		migrate->cpages++;
+		migrate_ctx->src[migrate_ctx->npages] = MIGRATE_PFN_MIGRATE;
+		migrate_ctx->dst[migrate_ctx->npages] = 0;
+		migrate_ctx->npages++;
+		migrate_ctx->cpages++;
 	}
 
 	return 0;
@@ -2164,12 +2154,12 @@ static int migrate_vma_collect_skip(unsigned long start,
 				    unsigned long end,
 				    struct mm_walk *walk)
 {
-	struct migrate_vma *migrate = walk->private;
+	struct migrate_dma_ctx *migrate_ctx = walk->private;
 	unsigned long addr;
 
 	for (addr = start & PAGE_MASK; addr < end; addr += PAGE_SIZE) {
-		migrate->dst[migrate->npages] = 0;
-		migrate->src[migrate->npages++] = 0;
+		migrate_ctx->dst[migrate_ctx->npages] = 0;
+		migrate_ctx->src[migrate_ctx->npages++] = 0;
 	}
 
 	return 0;
@@ -2180,7 +2170,7 @@ static int migrate_vma_collect_pmd(pmd_t *pmdp,
 				   unsigned long end,
 				   struct mm_walk *walk)
 {
-	struct migrate_vma *migrate = walk->private;
+	struct migrate_dma_ctx *migrate_ctx = walk->private;
 	struct vm_area_struct *vma = walk->vma;
 	struct mm_struct *mm = vma->vm_mm;
 	unsigned long addr = start, unmapped = 0;
@@ -2244,7 +2234,7 @@ again:
 
 		if (pte_none(pte)) {
 			mpfn = MIGRATE_PFN_MIGRATE;
-			migrate->cpages++;
+			migrate_ctx->cpages++;
 			pfn = 0;
 			goto next;
 		}
@@ -2269,11 +2259,11 @@ again:
 		} else {
 			if (is_zero_pfn(pfn)) {
 				mpfn = MIGRATE_PFN_MIGRATE;
-				migrate->cpages++;
+				migrate_ctx->cpages++;
 				pfn = 0;
 				goto next;
 			}
-			page = _vm_normal_page(migrate->vma, addr, pte, true);
+			page = _vm_normal_page(vma, addr, pte, true);
 			mpfn = migrate_pfn(pfn) | MIGRATE_PFN_MIGRATE;
 			mpfn |= pte_write(pte) ? MIGRATE_PFN_WRITE : 0;
 		}
@@ -2295,7 +2285,7 @@ again:
 		 * can't be dropped from it).
 		 */
 		get_page(page);
-		migrate->cpages++;
+		migrate_ctx->cpages++;
 
 		/*
 		 * Optimize for the common case where page is only mapped once
@@ -2328,8 +2318,8 @@ again:
 		}
 
 next:
-		migrate->dst[migrate->npages] = 0;
-		migrate->src[migrate->npages++] = mpfn;
+		migrate_ctx->dst[migrate_ctx->npages] = 0;
+		migrate_ctx->src[migrate_ctx->npages++] = mpfn;
 	}
 	arch_leave_lazy_mmu_mode();
 	pte_unmap_unlock(ptep - 1, ptl);
@@ -2349,7 +2339,10 @@ next:
  * valid page, it updates the src array and takes a reference on the page, in
  * order to pin the page until we lock it and unmap it.
  */
-static void migrate_vma_collect(struct migrate_vma *migrate)
+static void migrate_vma_collect(struct migrate_dma_ctx *migrate_ctx,
+				struct vm_area_struct *vma,
+				unsigned long start,
+				unsigned long end)
 {
 	struct mm_walk mm_walk;
 
@@ -2358,30 +2351,24 @@ static void migrate_vma_collect(struct migrate_vma *migrate)
 	mm_walk.pte_hole = migrate_vma_collect_hole;
 	mm_walk.hugetlb_entry = NULL;
 	mm_walk.test_walk = NULL;
-	mm_walk.vma = migrate->vma;
-	mm_walk.mm = migrate->vma->vm_mm;
-	mm_walk.private = migrate;
+	mm_walk.vma = vma;
+	mm_walk.mm = vma->vm_mm;
+	mm_walk.private = migrate_ctx;
 
-	mmu_notifier_invalidate_range_start(mm_walk.mm,
-					    migrate->start,
-					    migrate->end);
-	walk_page_range(migrate->start, migrate->end, &mm_walk);
-	mmu_notifier_invalidate_range_end(mm_walk.mm,
-					  migrate->start,
-					  migrate->end);
-
-	migrate->end = migrate->start + (migrate->npages << PAGE_SHIFT);
+	mmu_notifier_invalidate_range_start(mm_walk.mm, start, end);
+	walk_page_range(start, end, &mm_walk);
+	mmu_notifier_invalidate_range_end(mm_walk.mm, start, end);
 }
 
 /*
- * migrate_vma_check_page() - check if page is pinned or not
+ * migrate_dma_check_page() - check if page is pinned or not
  * @page: struct page to check
  *
  * Pinned pages cannot be migrated. This is the same test as in
  * migrate_page_move_mapping(), except that here we allow migration of a
  * ZONE_DEVICE page.
  */
-static bool migrate_vma_check_page(struct page *page)
+static bool migrate_dma_check_page(struct page *page)
 {
 	/*
 	 * One extra ref because caller holds an extra reference, either from
@@ -2436,31 +2423,29 @@ static bool migrate_vma_check_page(struct page *page)
 }
 
 /*
- * migrate_vma_prepare() - lock pages and isolate them from the lru
- * @migrate: migrate struct containing all migration information
+ * migrate_dma_prepare() - lock pages and isolate them from the lru
+ * @migrate_ctx: migrate struct containing all migration information
  *
  * This locks pages that have been collected by migrate_vma_collect(). Once each
  * page is locked it is isolated from the lru (for non-device pages). Finally,
  * the ref taken by migrate_vma_collect() is dropped, as locked pages cannot be
  * migrated by concurrent kernel threads.
  */
-static void migrate_vma_prepare(struct migrate_vma *migrate)
+static unsigned long migrate_dma_prepare(struct migrate_dma_ctx *migrate_ctx)
 {
-	const unsigned long npages = migrate->npages;
-	const unsigned long start = migrate->start;
-	unsigned long addr, i, restore = 0;
+	const unsigned long npages = migrate_ctx->npages;
+	unsigned long i, restore = 0;
 	bool allow_drain = true;
 
 	lru_add_drain();
 
-	for (i = 0; (i < npages) && migrate->cpages; i++) {
-		struct page *page = migrate_pfn_to_page(migrate->src[i]);
-		bool remap = true;
+	for (i = 0; (i < npages) && migrate_ctx->cpages; i++) {
+		struct page *page = migrate_pfn_to_page(migrate_ctx->src[i]);
 
 		if (!page)
 			continue;
 
-		if (!(migrate->src[i] & MIGRATE_PFN_LOCKED)) {
+		if (!(migrate_ctx->src[i] & MIGRATE_PFN_LOCKED)) {
 			/*
 			 * Because we are migrating several pages there can be
 			 * a deadlock between 2 concurrent migration where each
@@ -2470,13 +2455,12 @@ static void migrate_vma_prepare(struct migrate_vma *migrate)
 			 * for any page we can not lock right away.
 			 */
 			if (!trylock_page(page)) {
-				migrate->src[i] = 0;
-				migrate->cpages--;
+				migrate_ctx->src[i] = 0;
+				migrate_ctx->cpages--;
 				put_page(page);
 				continue;
 			}
-			remap = false;
-			migrate->src[i] |= MIGRATE_PFN_LOCKED;
+			migrate_ctx->src[i] |= MIGRATE_PFN_LOCKED;
 		}
 
 		/* ZONE_DEVICE pages are not on LRU */
@@ -2488,64 +2472,34 @@ static void migrate_vma_prepare(struct migrate_vma *migrate)
 			}
 
 			if (isolate_lru_page(page)) {
-				if (remap) {
-					migrate->src[i] &= ~MIGRATE_PFN_MIGRATE;
-					migrate->cpages--;
-					restore++;
-				} else {
-					migrate->src[i] = 0;
-					unlock_page(page);
-					migrate->cpages--;
-					put_page(page);
-				}
+				migrate_ctx->src[i] &= ~MIGRATE_PFN_MIGRATE;
+				migrate_ctx->cpages--;
+				restore++;
 				continue;
 			}
 
 			/* Drop the reference we took in collect */
+			migrate_ctx->src[i] |= MIGRATE_PFN_LRU;
 			put_page(page);
 		}
 
-		if (!migrate_vma_check_page(page)) {
-			if (remap) {
-				migrate->src[i] &= ~MIGRATE_PFN_MIGRATE;
-				migrate->cpages--;
-				restore++;
-
-				if (!is_zone_device_page(page)) {
-					get_page(page);
-					putback_lru_page(page);
-				}
-			} else {
-				migrate->src[i] = 0;
-				unlock_page(page);
-				migrate->cpages--;
-
-				if (!is_zone_device_page(page))
-					putback_lru_page(page);
-				else
-					put_page(page);
-			}
+		/*
+		 * This is not the final check, it is an early check to avoid
+		 * unecessary work if the page is pinned.
+		 */
+		if (!migrate_dma_check_page(page)) {
+			migrate_ctx->src[i] &= ~MIGRATE_PFN_MIGRATE;
+			migrate_ctx->cpages--;
+			restore++;
 		}
 	}
 
-	for (i = 0, addr = start; i < npages && restore; i++, addr += PAGE_SIZE) {
-		struct page *page = migrate_pfn_to_page(migrate->src[i]);
-
-		if (!page || (migrate->src[i] & MIGRATE_PFN_MIGRATE))
-			continue;
-
-		remove_migration_pte(page, migrate->vma, addr, page);
-
-		migrate->src[i] = 0;
-		unlock_page(page);
-		put_page(page);
-		restore--;
-	}
+	return restore;
 }
 
 /*
- * migrate_vma_unmap() - replace page mapping with special migration pte entry
- * @migrate: migrate struct containing all migration information
+ * migrate_dma_unmap() - replace page mapping with special migration pte entry
+ * @migrate_ctx: migrate struct containing migration context information
  *
  * Replace page mapping (CPU page table pte) with a special migration pte entry
  * and check again if it has been pinned. Pinned pages are restored because we
@@ -2554,17 +2508,16 @@ static void migrate_vma_prepare(struct migrate_vma *migrate)
  * This is the last step before we call the device driver callback to allocate
  * destination memory and copy contents of original page over to new page.
  */
-static void migrate_vma_unmap(struct migrate_vma *migrate)
+static unsigned long migrate_dma_unmap(struct migrate_dma_ctx *migrate_ctx)
 {
 	int flags = TTU_MIGRATION | TTU_IGNORE_MLOCK | TTU_IGNORE_ACCESS;
-	const unsigned long npages = migrate->npages;
-	const unsigned long start = migrate->start;
-	unsigned long addr, i, restore = 0;
+	const unsigned long npages = migrate_ctx->npages;
+	unsigned long i, restore = 0;
 
 	for (i = 0; i < npages; i++) {
-		struct page *page = migrate_pfn_to_page(migrate->src[i]);
+		struct page *page = migrate_pfn_to_page(migrate_ctx->src[i]);
 
-		if (!page || !(migrate->src[i] & MIGRATE_PFN_MIGRATE))
+		if (!page || !(migrate_ctx->src[i] & MIGRATE_PFN_MIGRATE))
 			continue;
 
 		if (page_mapped(page)) {
@@ -2573,41 +2526,24 @@ static void migrate_vma_unmap(struct migrate_vma *migrate)
 				goto restore;
 		}
 
-		if (migrate_vma_check_page(page))
+		if (migrate_dma_check_page(page))
 			continue;
 
 restore:
-		migrate->src[i] &= ~MIGRATE_PFN_MIGRATE;
-		migrate->cpages--;
+		migrate_ctx->src[i] &= ~MIGRATE_PFN_MIGRATE;
+		migrate_ctx->cpages--;
 		restore++;
 	}
 
-	for (addr = start, i = 0; i < npages && restore; addr += PAGE_SIZE, i++) {
-		struct page *page = migrate_pfn_to_page(migrate->src[i]);
-
-		if (!page || (migrate->src[i] & MIGRATE_PFN_MIGRATE))
-			continue;
-
-		remove_migration_ptes(page, page, false);
-
-		migrate->src[i] = 0;
-		unlock_page(page);
-		restore--;
-
-		if (is_zone_device_page(page))
-			put_page(page);
-		else
-			putback_lru_page(page);
-	}
+	return restore;
 }
 
-static void migrate_vma_insert_page(struct migrate_vma *migrate,
+static void migrate_vma_insert_page(struct vm_area_struct *vma,
 				    unsigned long addr,
 				    struct page *page,
 				    unsigned long *src,
 				    unsigned long *dst)
 {
-	struct vm_area_struct *vma = migrate->vma;
 	struct mm_struct *mm = vma->vm_mm;
 	struct mem_cgroup *memcg;
 	bool flush = false;
@@ -2738,47 +2674,47 @@ abort:
 }
 
 /*
- * migrate_vma_pages() - migrate meta-data from src page to dst page
- * @migrate: migrate struct containing all migration information
+ * migrate_dma_pages() - migrate meta-data from src page to dst page
+ * @migrate_ctx: migrate struct containing migration context information
  *
  * This migrates struct page meta-data from source struct page to destination
  * struct page. This effectively finishes the migration from source page to the
  * destination page.
  */
-static void migrate_vma_pages(struct migrate_vma *migrate)
+static void migrate_dma_pages(struct migrate_dma_ctx *migrate_ctx,
+			      struct vm_area_struct *vma,
+			      unsigned long start,
+			      unsigned long end)
 {
-	const unsigned long npages = migrate->npages;
-	const unsigned long start = migrate->start;
-	struct vm_area_struct *vma = migrate->vma;
+	const unsigned long npages = migrate_ctx->npages;
 	struct mm_struct *mm = vma->vm_mm;
 	unsigned long addr, i, mmu_start;
 	bool notified = false;
 
 	for (i = 0, addr = start; i < npages; addr += PAGE_SIZE, i++) {
-		struct page *newpage = migrate_pfn_to_page(migrate->dst[i]);
-		struct page *page = migrate_pfn_to_page(migrate->src[i]);
+		struct page *newpage = migrate_pfn_to_page(migrate_ctx->dst[i]);
+		struct page *page = migrate_pfn_to_page(migrate_ctx->src[i]);
 		struct address_space *mapping;
 		int r;
 
 		if (!newpage) {
-			migrate->src[i] &= ~MIGRATE_PFN_MIGRATE;
+			migrate_ctx->src[i] &= ~MIGRATE_PFN_MIGRATE;
 			continue;
 		}
 
 		if (!page) {
-			if (!(migrate->src[i] & MIGRATE_PFN_MIGRATE)) {
+			if (!(migrate_ctx->src[i] & MIGRATE_PFN_MIGRATE)) {
 				continue;
 			}
 			if (!notified) {
 				mmu_start = addr;
 				notified = true;
 				mmu_notifier_invalidate_range_start(mm,
-								mmu_start,
-								migrate->end);
+							mmu_start, end);
 			}
-			migrate_vma_insert_page(migrate, addr, newpage,
-						&migrate->src[i],
-						&migrate->dst[i]);
+			migrate_vma_insert_page(vma, addr, newpage,
+						&migrate_ctx->src[i],
+						&migrate_ctx->dst[i]);
 			continue;
 		}
 
@@ -2791,7 +2727,7 @@ static void migrate_vma_pages(struct migrate_vma *migrate)
 				 * migrating to un-addressable device memory.
 				 */
 				if (mapping) {
-					migrate->src[i] &= ~MIGRATE_PFN_MIGRATE;
+					migrate_ctx->src[i] &= ~MIGRATE_PFN_MIGRATE;
 					continue;
 				}
 			} else if (!is_device_public_page(newpage)) {
@@ -2799,14 +2735,14 @@ static void migrate_vma_pages(struct migrate_vma *migrate)
 				 * Other types of ZONE_DEVICE page are not
 				 * supported.
 				 */
-				migrate->src[i] &= ~MIGRATE_PFN_MIGRATE;
+				migrate_ctx->src[i] &= ~MIGRATE_PFN_MIGRATE;
 				continue;
 			}
 		}
 
 		r = migrate_page(mapping, newpage, page, MIGRATE_SYNC_NO_COPY);
 		if (r != MIGRATEPAGE_SUCCESS)
-			migrate->src[i] &= ~MIGRATE_PFN_MIGRATE;
+			migrate_ctx->src[i] &= ~MIGRATE_PFN_MIGRATE;
 	}
 
 	/*
@@ -2815,13 +2751,12 @@ static void migrate_vma_pages(struct migrate_vma *migrate)
 	 * did already call it.
 	 */
 	if (notified)
-		mmu_notifier_invalidate_range_only_end(mm, mmu_start,
-						       migrate->end);
+		mmu_notifier_invalidate_range_only_end(mm, mmu_start, end);
 }
 
 /*
- * migrate_vma_finalize() - restore CPU page table entry
- * @migrate: migrate struct containing all migration information
+ * migrate_dma_finalize() - restore CPU page table entry
+ * @migrate_ctx: migrate struct containing migration context information
  *
  * This replaces the special migration pte entry with either a mapping to the
  * new page if migration was successful for that page, or to the original page
@@ -2830,14 +2765,14 @@ static void migrate_vma_pages(struct migrate_vma *migrate)
  * This also unlocks the pages and puts them back on the lru, or drops the extra
  * refcount, for device pages.
  */
-static void migrate_vma_finalize(struct migrate_vma *migrate)
+static void migrate_dma_finalize(struct migrate_dma_ctx *migrate_ctx)
 {
-	const unsigned long npages = migrate->npages;
+	const unsigned long npages = migrate_ctx->npages;
 	unsigned long i;
 
 	for (i = 0; i < npages; i++) {
-		struct page *newpage = migrate_pfn_to_page(migrate->dst[i]);
-		struct page *page = migrate_pfn_to_page(migrate->src[i]);
+		struct page *newpage = migrate_pfn_to_page(migrate_ctx->dst[i]);
+		struct page *page = migrate_pfn_to_page(migrate_ctx->src[i]);
 
 		if (!page) {
 			if (newpage) {
@@ -2847,7 +2782,7 @@ static void migrate_vma_finalize(struct migrate_vma *migrate)
 			continue;
 		}
 
-		if (!(migrate->src[i] & MIGRATE_PFN_MIGRATE) || !newpage) {
+		if (!(migrate_ctx->src[i] & MIGRATE_PFN_MIGRATE) || !newpage) {
 			if (newpage) {
 				unlock_page(newpage);
 				put_page(newpage);
@@ -2857,7 +2792,7 @@ static void migrate_vma_finalize(struct migrate_vma *migrate)
 
 		remove_migration_ptes(page, newpage, false);
 		unlock_page(page);
-		migrate->cpages--;
+		migrate_ctx->cpages--;
 
 		if (is_zone_device_page(page))
 			put_page(page);
@@ -2874,16 +2809,42 @@ static void migrate_vma_finalize(struct migrate_vma *migrate)
 	}
 }
 
+static void migrate_vma_restore(struct migrate_dma_ctx *migrate_ctx,
+				struct vm_area_struct *vma,
+				unsigned long restore,
+				unsigned long start,
+				unsigned long end)
+{
+	unsigned long addr = start, i = 0;
+
+	for (; i < migrate_ctx->npages && restore; addr += PAGE_SIZE, i++) {
+		bool lru = migrate_ctx->src[i] & MIGRATE_PFN_LRU;
+		struct page *page;
+
+		page = migrate_pfn_to_page(migrate_ctx->src[i]);
+		if (!page || (migrate_ctx->src[i] & MIGRATE_PFN_MIGRATE))
+			continue;
+
+		remove_migration_ptes(page, page, false);
+
+		migrate_ctx->src[i] = 0;
+		unlock_page(page);
+		restore--;
+
+		if (!lru)
+			put_page(page);
+		else
+			putback_lru_page(page);
+	}
+}
+
 /*
  * migrate_vma() - migrate a range of memory inside vma
  *
- * @ops: migration callback for allocating destination memory and copying
+ * @migrate_ctx: migrate context structure
  * @vma: virtual memory area containing the range to be migrated
  * @start: start address of the range to migrate (inclusive)
  * @end: end address of the range to migrate (exclusive)
- * @src: array of hmm_pfn_t containing source pfns
- * @dst: array of hmm_pfn_t containing destination pfns
- * @private: pointer passed back to each of the callback
  * Returns: 0 on success, error code otherwise
  *
  * This function tries to migrate a range of memory virtual address range, using
@@ -2925,50 +2886,45 @@ static void migrate_vma_finalize(struct migrate_vma *migrate)
  * Both src and dst array must be big enough for (end - start) >> PAGE_SHIFT
  * unsigned long entries.
  */
-int migrate_vma(const struct migrate_vma_ops *ops,
+int migrate_vma(struct migrate_dma_ctx *migrate_ctx,
 		struct vm_area_struct *vma,
 		unsigned long start,
-		unsigned long end,
-		unsigned long *src,
-		unsigned long *dst,
-		void *private)
+		unsigned long end)
 {
-	struct migrate_vma migrate;
+	unsigned long npages, restore;
 
 	/* Sanity check the arguments */
 	start &= PAGE_MASK;
 	end &= PAGE_MASK;
 	if (!vma || is_vm_hugetlb_page(vma) || (vma->vm_flags & VM_SPECIAL))
 		return -EINVAL;
-	if (start < vma->vm_start || start >= vma->vm_end)
+	if (start >= end || start < vma->vm_start || start >= vma->vm_end)
 		return -EINVAL;
 	if (end <= vma->vm_start || end > vma->vm_end)
 		return -EINVAL;
-	if (!ops || !src || !dst || start >= end)
+	if (!migrate_ctx || !migrate_ctx->src || !migrate_ctx->dst)
 		return -EINVAL;
 
-	memset(src, 0, sizeof(*src) * ((end - start) >> PAGE_SHIFT));
-	migrate.src = src;
-	migrate.dst = dst;
-	migrate.start = start;
-	migrate.npages = 0;
-	migrate.cpages = 0;
-	migrate.end = end;
-	migrate.vma = vma;
+	migrate_ctx->npages = 0;
+	migrate_ctx->cpages = 0;
+	npages = (end - start) >> PAGE_SHIFT;
+	memset(migrate_ctx->src, 0, sizeof(*migrate_ctx->src) * npages);
 
 	/* Collect, and try to unmap source pages */
-	migrate_vma_collect(&migrate);
-	if (!migrate.cpages)
+	migrate_vma_collect(migrate_ctx, vma, start, end);
+	if (!migrate_ctx->cpages)
 		return 0;
 
 	/* Lock and isolate page */
-	migrate_vma_prepare(&migrate);
-	if (!migrate.cpages)
+	restore = migrate_dma_prepare(migrate_ctx);
+	migrate_vma_restore(migrate_ctx, vma, restore, start, end);
+	if (!migrate_ctx->cpages)
 		return 0;
 
 	/* Unmap pages */
-	migrate_vma_unmap(&migrate);
-	if (!migrate.cpages)
+	restore = migrate_dma_unmap(migrate_ctx);
+	migrate_vma_restore(migrate_ctx, vma, restore, start, end);
+	if (!migrate_ctx->cpages)
 		return 0;
 
 	/*
@@ -2979,17 +2935,77 @@ int migrate_vma(const struct migrate_vma_ops *ops,
 	 * Note that migration can fail in migrate_vma_struct_page() for each
 	 * individual page.
 	 */
-	ops->alloc_and_copy(vma, src, dst, start, end, private);
+	migrate_ctx->ops->alloc_and_copy(migrate_ctx);
 
 	/* This does the real migration of struct page */
-	migrate_vma_pages(&migrate);
+	migrate_dma_pages(migrate_ctx, vma, start, end);
 
-	ops->finalize_and_map(vma, src, dst, start, end, private);
+	migrate_ctx->ops->finalize_and_map(migrate_ctx);
 
 	/* Unlock and remap pages */
-	migrate_vma_finalize(&migrate);
+	migrate_dma_finalize(migrate_ctx);
 
 	return 0;
 }
 EXPORT_SYMBOL(migrate_vma);
+
+/*
+ * migrate_dma() - migrate an array of pages using a device DMA engine
+ *
+ * @migrate_ctx: migrate context structure
+ *
+ * The context structure must have its src fields pointing to an array of
+ * migrate pfn entry each corresponding to a valid page and each page being
+ * lock. The dst entry must by an array as big as src, it will be use during
+ * migration to store the destination pfn.
+ *
+ */
+int migrate_dma(struct migrate_dma_ctx *migrate_ctx)
+{
+	unsigned long i;
+
+	/* Sanity check the arguments */
+	if (!migrate_ctx->ops || !migrate_ctx->src || !migrate_ctx->dst)
+		return -EINVAL;
+
+	/* Below code should be hidden behind some DEBUG config */
+	for (i = 0; i < migrate_ctx->npages; ++i) {
+		const unsigned long mask = MIGRATE_PFN_VALID |
+					   MIGRATE_PFN_LOCKED;
+
+		if (!(migrate_ctx->src[i] & mask))
+			return -EINVAL;
+	}
+
+	/* Lock and isolate page */
+	migrate_dma_prepare(migrate_ctx);
+	if (!migrate_ctx->cpages)
+		return 0;
+
+	/* Unmap pages */
+	migrate_dma_unmap(migrate_ctx);
+	if (!migrate_ctx->cpages)
+		return 0;
+
+	/*
+	 * At this point pages are locked and unmapped, and thus they have
+	 * stable content and can safely be copied to destination memory that
+	 * is allocated by the callback.
+	 *
+	 * Note that migration can fail in migrate_vma_struct_page() for each
+	 * individual page.
+	 */
+	migrate_ctx->ops->alloc_and_copy(migrate_ctx);
+
+	/* This does the real migration of struct page */
+	migrate_dma_pages(migrate_ctx, NULL, 0, 0);
+
+	migrate_ctx->ops->finalize_and_map(migrate_ctx);
+
+	/* Unlock and remap pages */
+	migrate_dma_finalize(migrate_ctx);
+
+	return 0;
+}
+EXPORT_SYMBOL(migrate_dma);
 #endif /* defined(MIGRATE_VMA_HELPER) */
