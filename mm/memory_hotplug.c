@@ -852,7 +852,8 @@ static void node_states_set_node(int node, struct memory_notify *arg)
 	if (arg->status_change_nid_high >= 0)
 		node_set_state(node, N_HIGH_MEMORY);
 
-	node_set_state(node, N_MEMORY);
+	if (!node_state(node, N_COHERENT_MEMORY))
+		node_set_state(node, N_MEMORY);
 }
 
 bool allow_online_pfn_range(int nid, unsigned long pfn, unsigned long nr_pages, int online_type)
