@@ -869,16 +869,20 @@ bool allow_online_pfn_range(int nid, unsigned long pfn, unsigned long nr_pages, 
 	 * though so let's stick with it for simplicity for now.
 	 * TODO make sure we do not overlap with ZONE_DEVICE
 	 */
-	if (online_type == MMOP_ONLINE_KERNEL) {
+	switch (online_type) {
+	case MMOP_ONLINE_KERNEL:
 		if (zone_is_empty(movable_zone))
 			return true;
 		return movable_zone->zone_start_pfn >= pfn + nr_pages;
-	} else if (online_type == MMOP_ONLINE_MOVABLE) {
+	case MMOP_ONLINE_MOVABLE:
 		return zone_end_pfn(normal_zone) <= pfn;
+	case MMOP_ONLINE_KEEP:
+	case MMOP_ONLINE_COHERENT:
+		/* These will always succeed and inherit the current zone */
+		return true;
 	}
 
-	/* MMOP_ONLINE_KEEP will always succeed and inherits the current zone */
-	return online_type == MMOP_ONLINE_KEEP;
+	return false;
 }
 
 static void __meminit resize_zone_range(struct zone *zone, unsigned long start_pfn,
