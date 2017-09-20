@@ -265,6 +265,7 @@ struct migrate_dma_ctx {
 	unsigned long			*src;
 	unsigned long			cpages;
 	unsigned long			npages;
+	void				*private;
 };
 
 #if defined(CONFIG_MIGRATE_VMA_HELPER)
