@@ -2687,9 +2687,12 @@ static void migrate_dma_pages(struct migrate_dma_ctx *migrate_ctx,
 			      unsigned long end)
 {
 	const unsigned long npages = migrate_ctx->npages;
-	struct mm_struct *mm = vma->vm_mm;
+	struct mm_struct *mm = NULL;
 	unsigned long addr, i, mmu_start;
 	bool notified = false;
+
+	if (vma)
+		mm = vma->vm_mm;
 
 	for (i = 0, addr = start; i < npages; addr += PAGE_SIZE, i++) {
 		struct page *newpage = migrate_pfn_to_page(migrate_ctx->dst[i]);
@@ -2706,7 +2709,7 @@ static void migrate_dma_pages(struct migrate_dma_ctx *migrate_ctx,
 			if (!(migrate_ctx->src[i] & MIGRATE_PFN_MIGRATE)) {
 				continue;
 			}
-			if (!notified) {
+			if (!notified && mm) {
 				mmu_start = addr;
 				notified = true;
 				mmu_notifier_invalidate_range_start(mm,
