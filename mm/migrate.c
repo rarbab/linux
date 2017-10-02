@@ -2971,7 +2971,7 @@ int migrate_dma(struct migrate_dma_ctx *migrate_ctx)
 	/* Below code should be hidden behind some DEBUG config */
 	for (i = 0; i < migrate_ctx->npages; ++i) {
 		const unsigned long mask = MIGRATE_PFN_VALID |
-					   MIGRATE_PFN_LOCKED;
+					   MIGRATE_PFN_MIGRATE;
 
 		if (!(migrate_ctx->src[i] & mask))
 			return -EINVAL;
