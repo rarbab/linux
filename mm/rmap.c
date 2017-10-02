@@ -1351,7 +1351,8 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
 		return true;
 
 	if (IS_ENABLED(CONFIG_MIGRATION) && (flags & TTU_MIGRATION) &&
-	    is_zone_device_page(page) && !is_device_private_page(page))
+	    is_zone_device_page(page) && !is_device_private_page(page) &&
+	    !is_device_public_page(page))
 		return true;
 
 	if (flags & TTU_SPLIT_HUGE_PMD) {
